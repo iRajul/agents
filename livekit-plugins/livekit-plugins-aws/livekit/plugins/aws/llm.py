@@ -104,6 +104,7 @@ class LLM(llm.LLM):
             max_output_tokens=max_output_tokens,
             top_p=top_p,
             additional_request_fields=additional_request_fields,
+            cache_point=cache_point,
         )
 
     def chat(
