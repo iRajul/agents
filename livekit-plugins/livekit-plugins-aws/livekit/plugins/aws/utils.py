@@ -45,9 +45,9 @@ def to_fnc_ctx(fncs: list[FunctionTool]) -> list[dict]:
     return [_build_tool_spec(fnc) for fnc in fncs]
 
 
-def to_chat_ctx(chat_ctx: ChatContext, cache_key: Any) -> tuple[list[dict], dict | None]:
+def to_chat_ctx(chat_ctx: ChatContext, cache_key: Any, cache_point: Literal["default"] | None = None) -> tuple[list[dict], dict | None]:
     messages: list[dict] = []
-    system_message: dict | None = None
+    system_message: list[dict] | None = None
     current_role: str | None = None
     current_content: list[dict] = []
 
@@ -55,7 +55,10 @@ def to_chat_ctx(chat_ctx: ChatContext, cache_key: Any) -> tuple[list[dict], dict
         if msg.type == "message" and msg.role == "system":
             for content in msg.content:
                 if content and isinstance(content, str):
-                    system_message = {"text": content}
+                    if cache_point is not None:
+                        system_message = [{"text": content}, _create_cache_point()]
+                    else:
+                        system_message = [{"text": content}]
             continue
 
         if msg.type == "message":
@@ -112,6 +115,14 @@ def to_chat_ctx(chat_ctx: ChatContext, cache_key: Any) -> tuple[list[dict], dict
 
     return messages, system_message
 
+def _create_cache_point(cache_type: str = "default") -> Dict[str, Any]:
+    """Create a prompt caching configuration for Bedrock.
+    Args:
+        cache_type: Type of cache point. Default is "default".
+    Returns:
+        Dictionary containing prompt caching configuration.
+    """
+    return {"cachePoint": {"type": cache_type}}
 
 def _build_tool_spec(fnc: FunctionTool) -> dict:
     fnc = llm.utils.build_legacy_openai_schema(fnc, internally_tagged=True)

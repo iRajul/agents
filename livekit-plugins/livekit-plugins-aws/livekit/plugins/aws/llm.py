@@ -43,8 +43,9 @@ class _LLMOptions:
     tool_choice: NotGivenOr[ToolChoice]
     max_output_tokens: NotGivenOr[int]
     top_p: NotGivenOr[float]
+    cache_point: NotGivenOr[Literal["default"]]
     additional_request_fields: NotGivenOr[dict[str, Any]]
-
+    """if cache_point is set to "default", the system prompt will be cached."""
 
 class LLM(llm.LLM):
     def __init__(
@@ -60,6 +61,7 @@ class LLM(llm.LLM):
         tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
         additional_request_fields: NotGivenOr[dict[str, Any]] = NOT_GIVEN,
         session: aioboto3.Session | None = None,
+        cache_point: NotGivenOr[Literal["default"]] = NOT_GIVEN,
     ) -> None:
         """
         Create a new instance of AWS Bedrock LLM.
@@ -80,6 +82,7 @@ class LLM(llm.LLM):
             tool_choice (ToolChoice, optional): Specifies whether to use tools during response generation. Defaults to "auto".
             additional_request_fields (dict[str, Any], optional): Additional request fields to send to the AWS Bedrock Converse API. Defaults to None.
             session (aioboto3.Session, optional): Optional aioboto3 session to use.
+            cache_point (Literal["default"], optional): If set to "default", the system prompt will be cached. Defaults to None.
         """  # noqa: E501
         super().__init__()
 
@@ -140,10 +143,10 @@ class LLM(llm.LLM):
         tool_config = _get_tool_config()
         if tool_config:
             opts["toolConfig"] = tool_config
-        messages, system_message = to_chat_ctx(chat_ctx, id(self))
+        messages, system_message = to_chat_ctx(chat_ctx, id(self), cache_point=self._opts.cache_point)
         opts["messages"] = messages
         if system_message:
-            opts["system"] = [system_message]
+            opts["system"] = system_message
 
         inference_config = {}
         if is_given(self._opts.max_output_tokens):
@@ -240,6 +243,8 @@ class LLMStream(llm.LLMStream):
                     completion_tokens=metadata["usage"]["outputTokens"],
                     prompt_tokens=metadata["usage"]["inputTokens"],
                     total_tokens=metadata["usage"]["totalTokens"],
+                    cache_creation_input_tokens=metadata["usage"]["CacheWriteInputTokens"],
+                    cache_read_input_tokens=metadata["usage"]["CacheReadInputTokens"],
                 ),
             )
         elif "contentBlockStop" in chunk:
