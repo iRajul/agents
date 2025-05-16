@@ -11,7 +11,6 @@ from livekit import rtc
 
 from ..log import logger
 from .aio.utils import cancel_and_wait
-from .codecs import AudioStreamDecoder
 
 # deprecated aliases
 AudioBuffer = Union[list[rtc.AudioFrame], rtc.AudioFrame]
@@ -77,7 +76,8 @@ class AudioByteStream:
         if samples_per_channel is None:
             samples_per_channel = sample_rate // 10  # 100ms by default
 
-        self._bytes_per_frame = num_channels * samples_per_channel * ctypes.sizeof(ctypes.c_int16)
+        self._bytes_per_sample = num_channels * ctypes.sizeof(ctypes.c_int16)
+        self._bytes_per_frame = samples_per_channel * self._bytes_per_sample
         self._buf = bytearray()
 
     def push(self, data: bytes) -> list[rtc.AudioFrame]:
@@ -111,7 +111,7 @@ class AudioByteStream:
                     data=frame_data,
                     sample_rate=self._sample_rate,
                     num_channels=self._num_channels,
-                    samples_per_channel=len(frame_data) // 2,
+                    samples_per_channel=len(frame_data) // self._bytes_per_sample,
                 )
             )
 
@@ -164,6 +164,8 @@ async def audio_frames_from_file(
     Returns:
         AsyncIterable[rtc.AudioFrame]: An async iterable that yields decoded AudioFrame
     """
+    from .codecs import AudioStreamDecoder
+
     decoder = AudioStreamDecoder(sample_rate=sample_rate, num_channels=num_channels)
 
     async def file_reader():

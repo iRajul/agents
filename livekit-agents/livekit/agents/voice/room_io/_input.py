@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from typing import Generic, TypeVar, Union
 
 from typing_extensions import override
 
 import livekit.rtc as rtc
-from livekit.agents import utils
+from livekit.rtc._proto.track_pb2 import AudioTrackFeature
 
 from ...log import logger
+from ...utils import aio, log_exceptions
 from ..io import AudioInput, VideoInput
+from ._pre_connect_audio import PreConnectAudioHandler
 
 T = TypeVar("T", bound=Union[rtc.AudioFrame, rtc.VideoFrame])
 
@@ -26,10 +28,17 @@ class _ParticipantInputStream(Generic[T], ABC):
         self,
         room: rtc.Room,
         *,
-        track_source: rtc.TrackSource.ValueType,
+        track_source: rtc.TrackSource.ValueType | list[rtc.TrackSource.ValueType],
     ) -> None:
-        self._room, self._track_source = room, track_source
-        self._data_ch = utils.aio.Chan[T]()
+        self._room = room
+        self._accepted_sources = (
+            {track_source}
+            if isinstance(track_source, rtc.TrackSource.ValueType)
+            else set(track_source)
+        )
+
+        self._data_ch = aio.Chan[T]()
+        self._publication: rtc.RemoteTrackPublication | None = None
         self._stream: rtc.VideoStream | rtc.AudioStream | None = None
         self._participant_identity: str | None = None
         self._attached = True
@@ -38,6 +47,7 @@ class _ParticipantInputStream(Generic[T], ABC):
         self._tasks: set[asyncio.Task] = set()
 
         self._room.on("track_subscribed", self._on_track_available)
+        self._room.on("track_unpublished", self._on_track_unavailable)
 
     async def __anext__(self) -> T:
         return await self._data_ch.__anext__()
@@ -45,12 +55,21 @@ class _ParticipantInputStream(Generic[T], ABC):
     def __aiter__(self) -> AsyncIterator[T]:
         return self
 
+    @property
+    def publication_source(self) -> rtc.TrackSource.ValueType:
+        if not self._publication:
+            return rtc.TrackSource.SOURCE_UNKNOWN
+        return self._publication.source
+
     def on_attached(self) -> None:
         logger.debug(
             "input stream attached",
             extra={
                 "participant": self._participant_identity,
-                "source": rtc.TrackSource.Name(self._track_source),
+                "source": rtc.TrackSource.Name(self.publication_source),
+                "accepted_sources": [
+                    rtc.TrackSource.Name(source) for source in self._accepted_sources
+                ],
             },
         )
         self._attached = True
@@ -60,7 +79,10 @@ class _ParticipantInputStream(Generic[T], ABC):
             "input stream detached",
             extra={
                 "participant": self._participant_identity,
-                "source": rtc.TrackSource.Name(self._track_source),
+                "source": rtc.TrackSource.Name(self.publication_source),
+                "accepted_sources": [
+                    rtc.TrackSource.Name(source) for source in self._accepted_sources
+                ],
             },
         )
         self._attached = False
@@ -74,9 +96,9 @@ class _ParticipantInputStream(Generic[T], ABC):
             return
 
         self._participant_identity = participant_identity
+        self._close_stream()
 
         if participant_identity is None:
-            self._close_stream()
             return
 
         participant = (
@@ -94,22 +116,27 @@ class _ParticipantInputStream(Generic[T], ABC):
         if self._stream:
             await self._stream.aclose()
             self._stream = None
+        self._publication = None
         if self._forward_atask:
-            await utils.aio.cancel_and_wait(self._forward_atask)
+            await aio.cancel_and_wait(self._forward_atask)
 
         self._room.off("track_subscribed", self._on_track_available)
         self._data_ch.close()
 
-    @utils.log_exceptions(logger=logger)
+    @log_exceptions(logger=logger)
     async def _forward_task(
-        self, old_task: asyncio.Task | None, stream: rtc.VideoStream | rtc.AudioStream
+        self,
+        old_task: asyncio.Task | None,
+        stream: rtc.VideoStream | rtc.AudioStream,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
     ) -> None:
         if old_task:
-            await utils.aio.cancel_and_wait(old_task)
+            await aio.cancel_and_wait(old_task)
 
         extra = {
-            "participant": self._participant_identity,
-            "source": rtc.TrackSource.Name(self._track_source),
+            "participant": participant.identity,
+            "source": rtc.TrackSource.Name(publication.source),
         }
         logger.debug("start reading stream", extra=extra)
         async for event in stream:
@@ -129,24 +156,45 @@ class _ParticipantInputStream(Generic[T], ABC):
             task.add_done_callback(self._tasks.discard)
             self._tasks.add(task)
             self._stream = None
+            self._publication = None
 
     def _on_track_available(
         self,
         track: rtc.RemoteTrack,
         publication: rtc.RemoteTrackPublication,
         participant: rtc.RemoteParticipant,
-    ) -> None:
+    ) -> bool:
         if (
             self._participant_identity != participant.identity
-            or publication.source != self._track_source
+            or publication.source not in self._accepted_sources
+            or (self._publication and self._publication.sid == publication.sid)
+        ):
+            return False
+
+        self._close_stream()
+        self._stream = self._create_stream(track)
+        self._publication = publication
+        self._forward_atask = asyncio.create_task(
+            self._forward_task(self._forward_atask, self._stream, publication, participant)
+        )
+        return True
+
+    def _on_track_unavailable(
+        self, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
+    ) -> None:
+        if (
+            not self._publication
+            or self._publication.sid != publication.sid
+            or participant.identity != self._participant_identity
         ):
             return
 
         self._close_stream()
-        self._stream = self._create_stream(track)
-        self._forward_atask = asyncio.create_task(
-            self._forward_task(self._forward_atask, self._stream)
-        )
+
+        # subscribe to the first available track
+        for publication in participant.track_publications.values():
+            if self._on_track_available(publication.track, publication, participant):
+                return
 
 
 class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], AudioInput):
@@ -157,6 +205,7 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
         sample_rate: int,
         num_channels: int,
         noise_cancellation: rtc.NoiseCancellationOptions | None,
+        pre_connect_audio_handler: PreConnectAudioHandler | None,
     ) -> None:
         _ParticipantInputStream.__init__(
             self, room=room, track_source=rtc.TrackSource.SOURCE_MICROPHONE
@@ -164,6 +213,7 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
         self._sample_rate = sample_rate
         self._num_channels = num_channels
         self._noise_cancellation = noise_cancellation
+        self._pre_connect_audio_handler = pre_connect_audio_handler
 
     @override
     def _create_stream(self, track: rtc.Track) -> rtc.AudioStream:
@@ -174,11 +224,93 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
             noise_cancellation=self._noise_cancellation,
         )
 
+    @override
+    async def _forward_task(
+        self,
+        old_task: asyncio.Task | None,
+        stream: rtc.AudioStream,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        if old_task:
+            await aio.cancel_and_wait(old_task)
+
+        if (
+            self._pre_connect_audio_handler
+            and publication.track
+            and AudioTrackFeature.TF_PRECONNECT_BUFFER in publication.audio_features
+        ):
+            logging_extra = {
+                "track_id": publication.track.sid,
+                "participant": participant.identity,
+            }
+            try:
+                duration = 0
+                frames = await self._pre_connect_audio_handler.wait_for_data(publication.track.sid)
+                for frame in self._resample_frames(frames):
+                    if self._attached:
+                        await self._data_ch.send(frame)
+                        duration += frame.duration
+                if frames:
+                    logger.debug(
+                        "pre-connect audio buffer pushed",
+                        extra={"duration": duration, **logging_extra},
+                    )
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "timeout waiting for pre-connect audio buffer",
+                    extra=logging_extra,
+                )
+
+            except Exception as e:
+                logger.error(
+                    "error reading pre-connect audio buffer", extra=logging_extra, exc_info=e
+                )
+
+        await super()._forward_task(old_task, stream, publication, participant)
+
+        # push a silent frame to flush the stt final result if any
+        silent_samples = int(self._sample_rate * 0.5)
+        await self._data_ch.send(
+            rtc.AudioFrame(
+                b"\x00\x00" * silent_samples,
+                sample_rate=self._sample_rate,
+                num_channels=self._num_channels,
+                samples_per_channel=silent_samples,
+            )
+        )
+
+    def _resample_frames(self, frames: Iterable[rtc.AudioFrame]) -> Iterable[rtc.AudioFrame]:
+        resampler: rtc.AudioResampler | None = None
+        for frame in frames:
+            if (
+                not resampler
+                and self._sample_rate is not None
+                and frame.sample_rate != self._sample_rate
+            ):
+                resampler = rtc.AudioResampler(
+                    input_rate=frame.sample_rate, output_rate=self._sample_rate
+                )
+
+            if resampler:
+                yield from resampler.push(frame)
+            else:
+                yield frame
+
+        if resampler:
+            yield from resampler.flush()
+
 
 class _ParticipantVideoInputStream(_ParticipantInputStream[rtc.VideoFrame], VideoInput):
     def __init__(self, room: rtc.Room) -> None:
         _ParticipantInputStream.__init__(
-            self, room=room, track_source=rtc.TrackSource.SOURCE_CAMERA
+            self,
+            room=room,
+            track_source=[
+                rtc.TrackSource.SOURCE_CAMERA,
+                rtc.TrackSource.SOURCE_SCREENSHARE,
+            ],
         )
 
     @override
